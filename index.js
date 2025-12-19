@@ -1,15 +1,23 @@
 const express = require("express");
-const bcrypt = require("bcryptjs");
-const jwt = require("jsonwebtoken");
 const cors = require("cors");
 const multer = require("multer");
 const axios = require("axios");
 const { MongoClient, ObjectId } = require("mongodb");
+const admin = require("firebase-admin");
 require("dotenv").config();
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+/* ================= FIREBASE ADMIN ================= */
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert(
+      require("./serviceAccountKey.json")
+    ),
+  });
+}
 
 /* ================= DATABASE ================= */
 
@@ -23,23 +31,49 @@ client.connect().then(() => {
   Comments = db.collection("comments");
   Reports = db.collection("reports");
   Notifications = db.collection("notifications");
-  console.log("MongoDB connected (native)");
+  console.log("MongoDB connected");
 });
 
-/* ================= MIDDLEWARE ================= */
+/* ================= AUTH MIDDLEWARE (FIREBASE) ================= */
 
 const auth = async (req, res, next) => {
-  const token = req.headers.authorization?.split(" ")[1];
-  if (!token) return res.status(401).json("No token");
+  const header = req.headers.authorization;
+  if (!header) return res.status(401).json("No token");
+
+  const token = header.split(" ")[1];
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await Users.findOne({ _id: new ObjectId(decoded.id) });
-    if (!user || user.banned) return res.status(403).json("Access denied");
+    const decoded = await admin.auth().verifyIdToken(token);
+
+    let user = await Users.findOne({ email: decoded.email });
+
+    // Auto-create user in DB if not exists
+    if (!user) {
+      const newUser = {
+        fullName: decoded.name || "",
+        email: decoded.email,
+        role: "user",
+        banned: false,
+        profileImage: "",
+        coverImage: "",
+        bio: "",
+        location: "",
+        dateOfBirth: null,
+        followers: [],
+        following: [],
+        createdAt: new Date(),
+      };
+
+      const result = await Users.insertOne(newUser);
+      user = { ...newUser, _id: result.insertedId };
+    }
+
+    if (user.banned) return res.status(403).json("User banned");
+
     req.user = user;
     next();
-  } catch {
-    res.status(401).json("Invalid token");
+  } catch (err) {
+    return res.status(401).json("Invalid Firebase token");
   }
 };
 
@@ -55,14 +89,19 @@ const upload = multer({ storage: multer.memoryStorage() });
 const uploadToImgBB = async (buffer) => {
   const base64 = buffer.toString("base64");
   const res = await axios.post("https://api.imgbb.com/1/upload", null, {
-    params: { key: process.env.IMGBB_API_KEY, image: base64 }
+    params: { key: process.env.IMGBB_API_KEY, image: base64 },
   });
   return res.data.data.url;
 };
 
 /* ================= NOTIFICATION HELPER ================= */
 
-const createNotification = async ({ type, sender, receiver, postId = null }) => {
+const createNotification = async ({
+  type,
+  sender,
+  receiver,
+  postId = null,
+}) => {
   if (sender.toString() === receiver.toString()) return;
 
   await Notifications.insertOne({
@@ -71,47 +110,27 @@ const createNotification = async ({ type, sender, receiver, postId = null }) => 
     receiver,
     postId,
     read: false,
-    createdAt: new Date()
+    createdAt: new Date(),
   });
 };
 
-/* ================= AUTH ================= */
+/* ================= USER ================= */
 
 app.post("/api/register", async (req, res) => {
-  const hash = await bcrypt.hash(req.body.password, 10);
+  // Firebase already created the user
+  // This endpoint only stores profile data
+  await Users.updateOne(
+    { email: req.body.email },
+    {
+      $set: {
+        fullName: req.body.fullName,
+        email: req.body.email,
+      },
+    },
+    { upsert: true }
+  );
 
-  await Users.insertOne({
-    username: req.body.username,
-    email: req.body.email,
-    password: hash,
-
-    role: "user",
-    banned: false,
-
-    profileImage: "",
-    coverImage: "",
-    bio: "",
-    location: "",
-    dateOfBirth: null,
-
-    followers: [],
-    following: [],
-
-    createdAt: new Date()
-  });
-
-  res.json("User registered");
-});
-
-app.post("/api/login", async (req, res) => {
-  const user = await Users.findOne({ email: req.body.email });
-  if (!user) return res.status(400).json("Invalid credentials");
-
-  const valid = await bcrypt.compare(req.body.password, user.password);
-  if (!valid) return res.status(400).json("Invalid credentials");
-
-  const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET);
-  res.json({ token, user });
+  res.json("User profile saved");
 });
 
 /* ================= PROFILE ================= */
@@ -128,13 +147,19 @@ app.put("/api/profile", auth, async (req, res) => {
 
 app.put("/api/profile/avatar", auth, upload.single("image"), async (req, res) => {
   const image = await uploadToImgBB(req.file.buffer);
-  await Users.updateOne({ _id: req.user._id }, { $set: { profileImage: image } });
+  await Users.updateOne(
+    { _id: req.user._id },
+    { $set: { profileImage: image } }
+  );
   res.json(image);
 });
 
 app.put("/api/profile/cover", auth, upload.single("image"), async (req, res) => {
   const image = await uploadToImgBB(req.file.buffer);
-  await Users.updateOne({ _id: req.user._id }, { $set: { coverImage: image } });
+  await Users.updateOne(
+    { _id: req.user._id },
+    { $set: { coverImage: image } }
+  );
   res.json(image);
 });
 
@@ -159,69 +184,42 @@ app.post("/api/follow/:id", auth, async (req, res) => {
   await createNotification({
     type: "follow",
     sender: req.user._id,
-    receiver: targetId
+    receiver: targetId,
   });
 
   res.json("Followed");
 });
 
-app.post("/api/unfollow/:id", auth, async (req, res) => {
-  const targetId = new ObjectId(req.params.id);
-
-  await Users.updateOne(
-    { _id: req.user._id },
-    { $pull: { following: targetId } }
-  );
-
-  await Users.updateOne(
-    { _id: targetId },
-    { $pull: { followers: req.user._id } }
-  );
-
-  res.json("Unfollowed");
-});
-
 /* ================= POSTS ================= */
 
 app.post("/api/posts", auth, upload.single("image"), async (req, res) => {
-  const image = req.file ? await uploadToImgBB(req.file.buffer) : null;
+  try {
+    const image = req.file ? await uploadToImgBB(req.file.buffer) : null;
 
-  const post = {
-    content: req.body.content,
-    image,
-    author: req.user._id,
-    likes: [],
-    createdAt: new Date()
-  };
+    const post = {
+      content: req.body.content,
+      image,
+      author: req.user._id,
+      likes: [],
+      createdAt: new Date(),
+    };
 
-  await Posts.insertOne(post);
-  res.json(post);
-});
+    const result = await Posts.insertOne(post);
 
-app.get("/api/posts", async (req, res) => {
-  const posts = await Posts.find().sort({ createdAt: -1 }).toArray();
-  res.json(posts);
-});
-
-app.put("/api/posts/:id/like", auth, async (req, res) => {
-  const postId = new ObjectId(req.params.id);
-  const post = await Posts.findOne({ _id: postId });
-
-  if (!post.likes.some(id => id.toString() === req.user._id.toString())) {
-    await Posts.updateOne(
-      { _id: postId },
-      { $addToSet: { likes: req.user._id } }
-    );
-
-    await createNotification({
-      type: "like",
-      sender: req.user._id,
-      receiver: post.author,
-      postId
+    // ✅ send populated author
+    res.json({
+      ...post,
+      _id: result.insertedId,
+      author: {
+        _id: req.user._id,
+        fullName: req.user.fullName,
+        profileImage: req.user.profileImage,
+      },
     });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json("Post creation failed");
   }
-
-  res.json("Liked");
 });
 
 /* ================= COMMENTS ================= */
@@ -234,7 +232,7 @@ app.post("/api/posts/:id/comments", auth, async (req, res) => {
     text: req.body.text,
     postId,
     author: req.user._id,
-    createdAt: new Date()
+    createdAt: new Date(),
   };
 
   await Comments.insertOne(comment);
@@ -243,7 +241,7 @@ app.post("/api/posts/:id/comments", auth, async (req, res) => {
     type: "comment",
     sender: req.user._id,
     receiver: post.author,
-    postId
+    postId,
   });
 
   res.json(comment);
@@ -259,14 +257,6 @@ app.get("/api/notifications", auth, async (req, res) => {
   res.json(list);
 });
 
-app.put("/api/notifications/read-all", auth, async (req, res) => {
-  await Notifications.updateMany(
-    { receiver: req.user._id },
-    { $set: { read: true } }
-  );
-  res.json("All read");
-});
-
 /* ================= ADMIN ================= */
 
 app.put("/api/admin/users/:id/ban", auth, adminOnly, async (req, res) => {
@@ -275,12 +265,6 @@ app.put("/api/admin/users/:id/ban", auth, adminOnly, async (req, res) => {
     { $set: { banned: true } }
   );
   res.json("User banned");
-});
-
-app.delete("/api/admin/posts/:id", auth, adminOnly, async (req, res) => {
-  await Posts.deleteOne({ _id: new ObjectId(req.params.id) });
-  await Comments.deleteMany({ postId: new ObjectId(req.params.id) });
-  res.json("Post removed");
 });
 
 /* ================= SERVER ================= */
